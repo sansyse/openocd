@@ -12,7 +12,7 @@
 #include "config.h"
 #endif
 
-#include <stdint>
+#include <stdint.h>
 
 #include "imp.h"
 #include <helper/log.h>
@@ -23,127 +23,63 @@
 //#include <target/arm_adi_v5.h>
 //#include <target/cortex_m.h>
 
-struct STM32H5xxDef_s {
-	/* Device definition. */
-	uint32_t						IDCODE_RomTableAddr;
-	uint32_t						DevID;
-	const char*						DevStr;
-	struct {
-		uint32_t						RevID;
-		char							Revision;
-	}*								RevIDList;
-
-	/* Register definition. */
-	uint32_t						NSKEYR_Addr;
-	uint32_t						NSKEYR_Values[2];
-	uint32_t						NSCR_Addr;
-	uint32_t						NSCR_BitMask_Lock;
-	uint32_t						NSCR_BitMask_MassErase;
+struct RevIDList_s {
+	uint32_t						RevID;
+	char							Revision;
 };
 
-struct STM32H5xxPrv_s {
-	const struct STM32H5xxDef_s		Dev;
+struct RegBitset_s {
+	uint32_t						Addr;
+	uint32_t						Mask;
+	uint32_t						Value;
+};
+struct Operation_s {
+	struct RegBitset_s				Cmd;					/* Command:		Reg = ((Reg & (~Mask)) | Value) */
+	struct RegBitset_s				StatusCompleted;		/* Completetd:	(Reg & Mask) == Value */
+	struct RegBitset_s				StatusError;			/* Error:		(Reg & Mask) != Value */
+	uint32_t						Timeout;
 };
 
-const struct STM32H5xxDef_s DeviceDefs[] = {
-	{	.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
-		.DevID						= 0x484,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32H562/563/573",
-		.RevIDList					= {{0x1000, 'A'}, {0x1001, 'Z'}, {0x1007, 'X'}, {0, '\0'}},
-		.NSKEYR_Addr				= 0x40022004,
-		.NSKEYR_Values				= {0x45670123, 0xcdef89ab},
-		.NSCR_Addr					= 0x40022028,
-		.NSCR_BitMask_Lock			= (1u << 0),
-		.NSCR_BitMask_MassErase		= (1u << 15)|(1u << 5),
-	},
-	{	.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
-		.DevID						= 0x478,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32H523/533",
-		.RevIDList					= {{0x1000, 'A'}, {0x1001, 'Z'}, {0x1007, 'X'}, {0, '\0'}},
-		.NSKEYR_Addr				= 0x40022004,
-		.NSKEYR_Values				= {0x45670123, 0xcdef89ab},
-		.NSCR_Addr					= 0x40022028,
-		.NSCR_BitMask_Lock			= (1u << 0),
-		.NSCR_BitMask_MassErase		= (1u << 15)|(1u << 5),
-	},
-};
-
-static int FlashUnlock(struct flash_bank* bank) {
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	uint32_t nscr;
+static int Operation(struct flash_bank* bank, const struct Operation_s* op) {
 	int ret;
-	if ((ret = target_read_u32(bank->target, dev->NSCR_Addr, &nscr)) == ERROR_OK) {
-		if ((nscr & dev->NSCR_BitMask_Lock) != 0) {
-			if ((ret = target_write_u32(bank->target, dev->NSKEYR_Addr, dev->NSKEYR_Values[0])) == ERROR_OK) {
-				if ((ret = target_write_u32(bank->target, dev->NSKEYR_Addr, dev->NSKEYR_Values[1])) == ERROR_OK) {
-					if ((ret = target_read_u32(bank->target, dev->NSCR_Addr, &nscr)) == ERROR_OK) {
-						if ((nscr & dev->NSCR_BitMask_Lock) != 0) {
-							LOG_ERROR("Unable to unlock flash!");
-							ret		= ERROR_TARGET_FAILURE;
-						}
+	/* Issue command */
+	uint32_t val;
+	if (bank->target->state == TARGET_HALTED) {
+		if (((ret = target_read_u32(bank->target, op->Cmd.Addr, &val)) == ERROR_OK)
+				&& ((ret = target_write_u32(bank->target, op->Cmd.Addr, ((val & (~op->Cmd.Mask)) | op->Cmd.Value))) == ERROR_OK)) {
+			/* Wait until error or completion */
+			uint32_t to		= op->Timeout;
+			while (0 < to) {
+				if (0 < op->StatusError.Addr) {
+					/* Check for error */
+					if ((ret = target_read_u32(bank->target, op->StatusError.Addr, &val)) != ERROR_OK) {
+						break;
+					}
+					if ((val & op->StatusError.Mask) != op->StatusError.Value) {
+						/* Error */
+						ret		= ERROR_FAIL;
+						break;
 					}
 				}
-			}
-		}
-	}
-	if (ret != ERROR_OK) {
-		LOG_ERROR("flash_unlock failed (%d)!", ret);
-	}
-	return ret;
-}
 
-static int FlashLock(struct flash_bank* bank) {
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	return target_write_u32(bank->target, dev->NSCR_Addr, dev->NSCR_BitMask_Lock);
-}
-
-static int FlashWaitBusy(struct flash_bank* bank, unsigned int timeout) {
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	uint32_t nssr;
-	int ret;
-	for (;0 < timeout; timeout--) {
-		if ((ret = target_read_u32(bank->target, dev->NSSR_Addr, &nssr)) == ERROR_OK) {
-			if ((nscr & dev->NSSR_BitMask_Busy) != 0) {
-				ret		= ERROR_OK;
-				break;
-			}
-			alive_sleep(1);
-		}
-		else {
-			break;
-		}
-		ret		= ERROR_TIMEOUT_REACHED;
-	}
-	return ret;
-}
-
-static int GetInfo(struct flash_bank *bank, struct command_invocation *cmd) {
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	if (dev != NULL) {
-		command_print_sameline("");
-	}
-	return ERROR_OK;
-}
-
-static int FlashMassErase(struct flash_bank* bank) {
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	int ret;
-	if (bank->target->state == TARGET_HALTED) {
-		if ((ret = FlashUnlock(bank)) == ERROR_OK) {
-			if ((ret = target_write_u32(bank->target, dev->NSCR_Addr, dev->NSCR_BitMask_MassErase)) == ERROR_OK) {
-				if ((ret = FlashWaitBusy(bank, 250)) != ERROR_OK) 7
-					LOG_ERROR("Flash mass erase succeeded.");
+				if (0 < op->StatusCompleted.Addr) {
+					/* Check for success */
+					if ((ret = target_read_u32(bank->target, op->StatusCompleted.Addr, &val)) != ERROR_OK) {
+						break;
+					}
+					if ((val & op->StatusCompleted.Mask) == op->StatusCompleted.Value) {
+						/* Succes */
+						ret		= ERROR_OK;
+						break;
+					}
 				}
-				FlashLock(bank);
+
+				ret		= ERROR_TIMEOUT_REACHED;
+				to--;
 			}
 		}
 		if (ret != ERROR_OK) {
-			LOG_ERROR("Flash mass erase failed! (%d)", ret);
+			LOG_ERROR("operation failed (%d)!", ret);
 		}
 	}
 	else {
@@ -151,6 +87,138 @@ static int FlashMassErase(struct flash_bank* bank) {
 		ret		= ERROR_TARGET_NOT_HALTED;
 	}
 	return ret;
+}
+
+struct FlashBlock_s {
+	uint32_t						BaseAddr;
+	uint32_t						MaxSize;
+	uint32_t						SectorSize;
+	uint32_t						Key_Addr;
+	uint32_t						Key_Values[2];
+	struct Operation_s				BankSelect;
+	struct Operation_s				PageErase;
+	struct Operation_s				PageWrite;
+};
+
+struct STM32H5xxDef_s {
+	/* Device definition. */
+	uint32_t						IDCODE_RomTableAddr;
+	uint32_t						DevID;
+	const char*						DevStr;
+	const struct RevIDList_s*		RevIDList;
+	const struct FlashBlock_s*		FlashBlocks;
+	size_t							FlashBlockSize;
+	struct Operation_s				MassErase;
+	struct Operation_s				FlashLock;
+	struct Operation_s				FlashUnlock;
+};
+
+struct STM32H5xxPrv_s {
+	const struct STM32H5xxDef_s		Dev;
+};
+
+const struct RevIDList_s RevIDList_H5[] = {{0x1000, 'A'}, {0x1001, 'Z'}, {0x1007, 'X'}, {0, '\0'}};
+const struct FlashBlock_s FlashesH5[] = {
+	#define	H5_NSKEYR				(0x40022000 + 0x004)
+	#define	H5_NSSR					(0x40022000 + 0x020)
+	#define	H5_NSCR					(0x40022000 + 0x028)
+	{	.BaseAddr					= 0x80000000,
+		.MaxSize					= 0x00100000,						/* max. 1MB/bank */
+		.SectorSize					= 8*1024,
+		.Key_Addr					= H5_NSKEYR,
+		.Key_Values					= {0x45670123, 0xcdef89ab},
+		.BankSelect					= {{0,}, {0,}, {0,}, 0},				/* n.a. */
+		.PageErase					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00000001, 0x00000001},
+										.StatusError		= {},
+										1000},
+		.PageWrite					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00000001, 0x00000001},
+										.StatusError		= {},
+										1000}},
+	{	.BaseAddr					= 0x80100000,
+		.MaxSize					= 0x00100000,						/* max. 1MB/bank */
+		.SectorSize					= 8*1024,
+		.Key_Addr					= 0x40033004,
+		.Key_Values					= {0x45670123, 0xcdef89ab},
+		.BankSelect					= {{0,}, {0,}, {0,}, 0},				/* n.a. */
+		.PageErase					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00000001, 0x00000001},
+										.StatusError		= {},
+										1000},
+		.PageWrite					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00000001, 0x00000001},
+										.StatusError		= {},
+										1000}},
+};
+const struct STM32H5xxDef_s DeviceDefs[] = {
+	{	.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
+		.DevID						= 0x484,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32H562/563/573",
+		.RevIDList					= RevIDList_H5,
+		.FlashBlocks				= FlashesH5,
+		.FlashBlockSize				= sizeof(FlashesH5)/sizeof(FlashesH5[0]),
+		.MassErase					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00ff0001, 0x00010001},
+										.StatusError		= {H5_NSSR, 0x00fe0000, 0x00000000},
+										250},
+		.FlashLock					= {	.Cmd				= {H5_NSCR, 0x00000001, 0x00000001},
+										.StatusCompleted	= {},
+										.StatusError		= {},
+										250},
+		.FlashUnlock					= {	.Cmd			= {H5_NSCR, 0x00000001, 0x00000000},
+										.StatusCompleted	= {},
+										.StatusError		= {},
+										250},
+	},
+	{	.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
+		.DevID						= 0x478,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32H523/533",
+		.RevIDList					= RevIDList_H5,
+		.FlashBlocks				= FlashesH5,
+		.FlashBlockSize				= sizeof(FlashesH5)/sizeof(FlashesH5[0]),
+		.MassErase					= {	.Cmd				= {H5_NSCR, 0xffffffff, 0x00008020},
+										.StatusCompleted	= {H5_NSSR, 0x00ff0001, 0x00010001},
+										.StatusError		= {H5_NSSR, 0x00fe0000, 0x00000000},
+										250},
+		.FlashLock					= {	.Cmd				= {0x40022028, 0x00000001, 0x00000001},
+										.StatusCompleted	= {},
+										.StatusError		= {},
+										250},
+		.FlashUnlock					= {	.Cmd			= {0x40022028, 0x00000001, 0x00000000},
+										.StatusCompleted	= {},
+										.StatusError		= {},
+										250},
+	},
+};
+
+static int FlashMassErase(struct flash_bank* bank) {
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	const struct STM32H5xxDef_s* dev	= &(this->Dev);
+	return Operation(bank, &(dev->MassErase));
+}
+
+#if 0
+static int FlashUnlock(struct flash_bank* bank) {
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	const struct STM32H5xxDef_s* dev	= &(this->Dev);
+	return Operation(bank, &(dev->FlashUnlock));
+}
+
+static int FlashLock(struct flash_bank* bank) {
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	const struct STM32H5xxDef_s* dev	= &(this->Dev);
+	return Operation(bank, &(dev->FlashLock));
+}
+#endif
+
+static int GetInfo(struct flash_bank *bank, struct command_invocation *cmd) {
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	const struct STM32H5xxDef_s* dev	= &(this->Dev);
+	if (dev != NULL) {
+		command_print_sameline(cmd, "-");
+	}
+	return ERROR_OK;
 }
 
 COMMAND_HANDLER(STM32H5_MassEraseCommand) {
@@ -181,7 +249,7 @@ COMMAND_HANDLER(STM32H5_FlashLockCommand) {
 			struct target* target = bank->target;
 			if (target->state == TARGET_HALTED) {
 				struct STM32H5xxPrv_s* this			= bank->driver_priv;
-				const struct STM32H5xxDef_s* dev	= this->Dev;
+				const struct STM32H5xxDef_s* dev	= &(this->Dev);
 			}
 			else {
 				LOG_ERROR("Target not halted");
