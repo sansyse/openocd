@@ -36,15 +36,18 @@ struct STM32H5xxDef_s {
 	uint32_t						DevID;
 	const char*						DevStr;
 	const struct RevIDList_s*		RevIDList;
+	uint32_t						FlashBaseAddr;
+	uint32_t						FlashBusWidth;
+	uint32_t						FlashPageSize;
 	uint32_t						MaxFlashSize;
 	uint32_t						FlashSize_Addr;
 	int								(* MassErase)(struct flash_bank*);
 	int								(* Erase)(struct flash_bank*, unsigned int, unsigned int);
+	int								(* Write)(struct flash_bank*, const uint8_t*, uint32_t, uint32_t);
 };
 
 struct STM32H5xxPrv_s {
-	const struct STM32H5xxDef_s*	Dev;
-	uint32_t						FlashSize;
+	const struct STM32H5xxDef_s*	Def;
 };
 
 
@@ -82,46 +85,59 @@ static int Unlock_U5(struct flash_bank* bank) {
 	return ret;
 }
 
-static int MassErase_U5(struct flash_bank* bank) {
-	int ret								= ERROR_FAIL;
-	uint32_t val;
-	/* Check if no operation is on-going. */
-	if ((ret = target_read_u32(bank->target, U5_NSSR, &val)) == ERROR_OK) {
-		if ((val & 0x00010000) == 0) {
-			/* Clear all error flags. */
-			if ((ret = target_write_u32(bank->target, U5_NSSR, 0x000020fb)) == ERROR_OK) {
-				/* Unlock flash */
-				if ((ret = Unlock_U5(bank)) == ERROR_OK) {
-					/* Start mass erase */
-					if ((ret = target_write_u32(bank->target, U5_NSCR, 0x00018004)) == ERROR_OK) {
-						uint32_t timeout		= 3000;
-						while (0 < timeout) {
-							alive_sleep(1);
-							if ((ret = target_read_u32(bank->target, U5_NSSR, &val)) == ERROR_OK) {
-								if ((val & 0x000020fa) != 0) {
-									ret		= ERROR_FAIL;
-									break;
-								}
-								else if ((val & 0x00010001) == 0x00000001) {
-									ret		= ERROR_OK;
-									break;
-								}
-							}
-							timeout--;
-						}
-
-						/* Reset MER1 and MER2 bits */
-						target_write_u32(bank->target, U5_NSCR, 0x00000000);
-					}
-
-					/* Lock flash */
-					Lock_U5(bank);
-				}
+static int Wait4EOP_U5(struct flash_bank* bank, unsigned int timeout) {
+	int ret		= ERROR_FAIL;
+	while (0 < timeout) {
+		alive_sleep(1);
+		uint32_t val;
+		if ((ret = target_read_u32(bank->target, U5_NSSR, &val)) == ERROR_OK) {
+			if ((val & 0x000020fa) != 0) {
+				ret		= ERROR_FAIL;
+				break;
+			}
+			else if ((val & 0x00010001) == 0x00000001) {
+				ret		= ERROR_OK;
+				break;
 			}
 		}
-		else {
-			ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		timeout--;
+		ret			= ERROR_FAIL;
+	}
+	return ret;
+}
+
+static int CheckNoOp_U5(struct flash_bank* bank) {
+	int ret;
+	uint32_t val;
+	if ((ret = target_read_u32(bank->target, U5_NSSR, &val)) == ERROR_OK) {
+		if ((val & 0x00010000) == 0) {
+			return ERROR_OK;
 		}
+		ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		LOG_ERROR("Operation in progress!");
+	}
+	return ret;
+}
+
+static int ClearErrorFlags_U5(struct flash_bank* bank) {
+	return target_write_u32(bank->target, U5_NSSR, 0x000020fb);
+}
+
+static int MassErase_U5(struct flash_bank* bank) {
+	int ret								= ERROR_FAIL;
+	if ((ret = CheckNoOp_U5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_U5(bank)) == ERROR_OK
+		&& (ret = Unlock_U5(bank)) == ERROR_OK) {
+		/* Start mass erase */
+		if ((ret = target_write_u32(bank->target, U5_NSCR, 0x00018004)) == ERROR_OK) {
+			ret			= Wait4EOP_U5(bank, 3000);
+
+			/* Reset MER1 and MER2 bits */
+			target_write_u32(bank->target, U5_NSCR, 0x00000000);
+		}
+
+		/* Lock flash */
+		Lock_U5(bank);
 	}
 	return ret;
 }
@@ -167,52 +183,150 @@ static int Unlock_H5(struct flash_bank* bank) {
 	return ret;
 }
 
-static int MassErase_H5(struct flash_bank* bank) {
-	int ret								= ERROR_FAIL;
-	uint32_t val;
-	/* Check if no operation is on-going. */
-	if ((ret = target_read_u32(bank->target, H5_NSSR, &val)) == ERROR_OK) {
-		if ((val & 0x0000000b) == 0) {
-			/* Clear all error flags. */
-			if ((ret = target_write_u32(bank->target, H5_NSCCR, 0x00ff0000)) == ERROR_OK) {
-				/* Unlock flash */
-				if ((ret = Unlock_H5(bank)) == ERROR_OK) {
-					/* Start mass erase */
-					if ((ret = target_write_u32(bank->target, H5_NSCR, 0x00008020)) == ERROR_OK) {
-						uint32_t timeout		= 3000;
-						while (0 < timeout) {
-							alive_sleep(1);
-							if ((ret = target_read_u32(bank->target, H5_NSSR, &val)) == ERROR_OK) {
-								if ((val & 0x00fe0000) != 0) {
-									ret		= ERROR_FAIL;
-									break;
-								}
-								else if ((val & 0x0001000b) == 0x00010000) {
-									ret		= ERROR_OK;
-									break;
-								}
-							}
-							timeout--;
-						}
-
-						/* Reset MER bit */
-						target_write_u32(bank->target, H5_NSCR, 0x00008000);
-					}
-
-					/* Lock flash */
-					Lock_H5(bank);
-				}
+static int Wait4EOP_H5(struct flash_bank* bank, unsigned int timeout) {
+	int ret		= ERROR_FAIL;
+	while (0 < timeout) {
+		alive_sleep(1);
+		uint32_t val;
+		if ((ret = target_read_u32(bank->target, H5_NSSR, &val)) == ERROR_OK) {
+			if ((val & 0x00fe0000) != 0) {
+				ret		= ERROR_FAIL;
+				break;
+			}
+			else if ((val & 0x0001000b) == 0x00010000) {
+				ret		= ERROR_OK;
+				break;
 			}
 		}
-		else {
-			ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		timeout--;
+		ret			= ERROR_FAIL;
+	}
+	return ret;
+}
+
+static int CheckNoOp_H5(struct flash_bank* bank) {
+	int ret;
+	uint32_t val;
+	if ((ret = target_read_u32(bank->target, H5_NSSR, &val)) == ERROR_OK) {
+		if ((val & 0x0000000b) == 0) {
+			return ERROR_OK;
 		}
+		ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		LOG_ERROR("Operation in progress!");
+	}
+	return ret;
+}
+
+static int ClearErrorFlags_H5(struct flash_bank* bank) {
+	return target_write_u32(bank->target, H5_NSCCR, 0x00ff0000);
+}
+
+static int MassErase_H5(struct flash_bank* bank) {
+	assert(bank != NULL);
+	int ret								= ERROR_FAIL;
+	if ((ret = CheckNoOp_H5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_H5(bank)) == ERROR_OK
+		&& (ret = Unlock_H5(bank)) == ERROR_OK) {
+		/* Start mass erase */
+		if ((ret = target_write_u32(bank->target, H5_NSCR, 0x00008020)) == ERROR_OK) {
+			ret			= Wait4EOP_H5(bank, 3000);
+
+			/* Reset MER bit */
+			target_write_u32(bank->target, H5_NSCR, 0x00000000);
+		}
+
+		/* Lock flash */
+		Lock_H5(bank);
 	}
 	return ret;
 }
 
 static int Erase_H5(struct flash_bank* bank, unsigned int first, unsigned int last) {
-	return 0;
+	assert(bank != NULL);
+	struct STM32H5xxPrv_s* prv			= (struct STM32H5xxPrv_s*)(bank->driver_priv);
+	assert(prv != NULL);
+	const struct STM32H5xxDef_s* def	= prv->Def;
+	assert(def != NULL);
+	unsigned int nSectorsTotal			= bank->size / def->FlashPageSize;
+	assert((nSectorsTotal & 1) == 0);
+	assert(first <= last && last <= nSectorsTotal);
+	unsigned int nSectorsPerBank		= nSectorsTotal;
+	assert(nSectorsPerBank < 0x7f);
+	int ret								= ERROR_FAIL;
+
+	if ((ret = CheckNoOp_H5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_H5(bank)) == ERROR_OK
+		&& (ret = Unlock_H5(bank)) == ERROR_OK) {
+		for (unsigned int sector = first; sector <= last; sector++) {
+			LOG_INFO("Erasing sector %u (%u..%u)", sector, first, last);
+
+			uint32_t cr		= 0x00000024u;
+			if (sector < nSectorsPerBank) {
+				cr			|= (sector << 6);
+			}
+			else {
+				cr			|= ((sector - nSectorsPerBank) << 6) | (0x80000000u);
+			}
+
+			/* Start sector erase */
+			if ((ret = target_write_u32(bank->target, H5_NSCR, cr)) == ERROR_OK) {
+				ret			= Wait4EOP_H5(bank, 300);
+
+				/* Reset SER bit */
+				target_write_u32(bank->target, H5_NSCR, 0x00000000);
+			}
+		}
+
+		/* Lock flash */
+		Lock_H5(bank);
+	}
+	return ret;
+}
+
+static int Write_H5(struct flash_bank* bank, const uint8_t* buffer, uint32_t dstOffs, uint32_t nBytes) {
+	assert(bank != NULL);
+	assert((dstOffs + nBytes) <= bank->size);
+	uint32_t addr						= (dstOffs + bank->base);
+	assert((addr & 127) == 0);
+	assert(bank->chip_width == 128/8);
+	struct STM32H5xxPrv_s* prv			= (struct STM32H5xxPrv_s*)(bank->driver_priv);
+	assert(prv != NULL);
+	const struct STM32H5xxDef_s* def	= prv->Def;
+	assert(def != NULL);
+	int ret								= ERROR_FAIL;
+
+	if ((ret = CheckNoOp_H5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_H5(bank)) == ERROR_OK
+		&& (ret = Unlock_H5(bank)) == ERROR_OK) {
+		LOG_INFO("Programming %u bytes at 0x%08x", nBytes, addr);
+		/* Start programming */
+		if ((ret = target_write_u32(bank->target, H5_NSCR, 0x00000002)) == ERROR_OK) {
+			uint8_t		data[128/8];
+			while (0 < nBytes && ret == ERROR_OK) {
+				size_t bi	= 0;
+				while (bi < sizeof(data) && 0 < nBytes) {
+					data[bi++]		= *(buffer++);
+					nBytes--;
+				}
+				while (bi < sizeof(data)) {
+					data[bi++]		= 0xff;
+				}
+				if ((ret = target_write_memory(bank->target, addr, 32/8, 128/32, data)) != ERROR_OK) {
+					LOG_ERROR("Write operation failed! 0x%08x", addr);
+					break;
+				}
+				addr		+= 128/8;
+				ret			= Wait4EOP_H5(bank, 300);
+			}
+
+			/* Reset PG bit */
+			target_write_u32(bank->target, H5_NSCR, 0x00000000);
+		}
+
+		/* Lock flash */
+		Lock_H5(bank);
+	}
+	return ret;
 }
 #undef H5_NSKEYR
 #undef H5_NSSR
@@ -227,10 +341,10 @@ static int Erase_H5(struct flash_bank* bank, unsigned int first, unsigned int la
 #define	H7_CR(_bank_)			(0x52002000 + ((_bank_) == 0 ? 0x00c : 0x10c))
 #define	H7_CCR(_bank_)			(0x52002000 + ((_bank_) == 0 ? 0x014 : 0x114))
 
-static int Lock_H7(struct flash_bank* bank, int bankNum) {
+static int Lock_H7(struct flash_bank* bank, unsigned int bankNum) {
 	return target_write_u32(bank->target, H7_CR(bankNum), 0x00000001);
 }
-static int Unlock_H7(struct flash_bank* bank, int bankNum) {
+static int Unlock_H7(struct flash_bank* bank, unsigned int bankNum) {
 	int ret								= ERROR_FAIL;
 	uint32_t val;
 	/* Check if locked. */
@@ -253,47 +367,60 @@ static int Unlock_H7(struct flash_bank* bank, int bankNum) {
 	return ret;
 }
 
+static int Wait4EOP_H7(struct flash_bank* bank, unsigned int bankNum, unsigned int timeout) {
+	int ret		= ERROR_FAIL;
+	while (0 < timeout) {
+		alive_sleep(1);
+		uint32_t val;
+		if ((ret = target_read_u32(bank->target, H7_SR(bankNum), &val)) == ERROR_OK) {
+			if ((val & 0x00ff0000) != 0) {
+				ret		= ERROR_FAIL;
+				break;
+			}
+			else if ((val & 0x0000000b) == 0) {
+				ret		= ERROR_OK;
+				break;
+			}
+		}
+		timeout--;
+		ret			= ERROR_FAIL;
+	}
+	return ret;
+}
+
+static int CheckNoOp_H7(struct flash_bank* bank, unsigned int bankNum) {
+	int ret;
+	uint32_t val;
+	if ((ret = target_read_u32(bank->target, H7_SR(bankNum), &val)) == ERROR_OK) {
+		if ((val & 0x0000000b) == 0) {
+			return ERROR_OK;
+		}
+		ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		LOG_ERROR("Operation in progress!");
+	}
+	return ret;
+}
+
+static int ClearErrorFlags_H7(struct flash_bank* bank, unsigned int bankNum) {
+	return target_write_u32(bank->target, H7_CCR(bankNum), 0x00ff0000);
+}
+
 static int MassErase_H7(struct flash_bank* bank) {
 	int ret								= ERROR_FAIL;
-	uint32_t val;
-	for (int bankNum = 0; bankNum < 2; bankNum++) {
-		/* Check if no operation is on-going. */
-		if ((ret = target_read_u32(bank->target, H7_SR(bankNum), &val)) == ERROR_OK) {
-			if ((val & 0x0000000b) == 0) {
-				/* Clear all error flags. */
-				if ((ret = target_write_u32(bank->target, H7_CCR(bankNum), 0x00ff0000)) == ERROR_OK) {
-					/* Unlock flash */
-					if ((ret = Unlock_H7(bank, bankNum)) == ERROR_OK) {
-						/* Start mass erase */
-						if ((ret = target_write_u32(bank->target, H7_CR(bankNum), 0x00008020)) == ERROR_OK) {
-							uint32_t timeout		= 3000;
-							while (0 < timeout) {
-								alive_sleep(1);
-								if ((ret = target_read_u32(bank->target, H7_SR(bankNum), &val)) == ERROR_OK) {
-									if ((val & 0x00ff0000) != 0) {
-										ret		= ERROR_FAIL;
-										break;
-									}
-									else if ((val & 0x0000000b) == 0) {
-										ret		= ERROR_OK;
-										break;
-									}
-								}
-								timeout--;
-							}
+	for (unsigned int bankNum = 0; bankNum < 2; bankNum++) {
+		if ((ret = CheckNoOp_H7(bank, bankNum)) == ERROR_OK
+			&& (ret = ClearErrorFlags_H7(bank, bankNum)) == ERROR_OK
+			&& (ret = Unlock_H7(bank, bankNum)) == ERROR_OK) {
+			/* Start mass erase */
+			if ((ret = target_write_u32(bank->target, H7_CR(bankNum), 0x00008020)) == ERROR_OK) {
+				ret			= Wait4EOP_H7(bank, bankNum, 3000);
 
-							/* Reset MER bit */
-							target_write_u32(bank->target, H7_CR(bankNum), 0x00008000);
-						}
+				/* Reset MER bit */
+				target_write_u32(bank->target, H7_CR(bankNum), 0x00000000);
+			}
 
-						/* Lock flash */
-						Lock_H7(bank, bankNum);
-					}
-				}
-			}
-			else {
-				ret		= ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-			}
+			/* Lock flash */
+			Lock_H7(bank, bankNum);
 		}
 	}
 	return ret;
@@ -308,216 +435,43 @@ static int Erase_H7(struct flash_bank* bank, unsigned int first, unsigned int la
 #undef H7_CCR
 
 
-const struct RevIDList_s RevIDList_U5F_U5G[] = {{0x1000, 'A'}, {0x1001, 'Z'}, {0, '\0'}};
-const struct RevIDList_s RevIDList_U59_U5A[] = {{0x3001, 'X'}, {0, '\0'}};
-const struct RevIDList_s RevIDList_U575_U585[] = {{0x2001, 'X'}, {0x3001, 'W'}, {0, '\0'}};
-const struct RevIDList_s RevIDList_U535_U545[] = {{0x1001, 'Z'}, {0, '\0'}};
-const struct RevIDList_s RevIDList_H5[] = {{0x1000, 'A'}, {0x1001, 'Z'}, {0x1007, 'X'}, {0, '\0'}};
-const struct RevIDList_s RevIDList_H7[] = {{0x1001, 'Z'}, {0x1003, 'Y'}, {0x2001, 'X'}, {0x2003, 'V'}, {0, '\0'}};
-const struct STM32H5xxDef_s DeviceDefs[] = {
-	/* U535xB	128k
-	 * U535xC	256k
-	 * U535xE	512k
-	 * U545xE	512k */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
-		.DevID						= 0x455,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32U535/545",
-		.RevIDList					= RevIDList_U535_U545,
-		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
-		.MassErase					= MassErase_U5,
-		.Erase						= Erase_U5,
-	},
-	/* U5GxxJ	4M
-	 * U5FxxJ	4M
-	 * U5FxxI	2M */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
-		.DevID						= 0x476,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32U5Fx/5Gx",
-		.RevIDList					= RevIDList_U5F_U5G,
-		.MaxFlashSize				= 4*1024*1024,			/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
-		.MassErase					= MassErase_U5,
-		.Erase						= Erase_U5,
-	},
-	/* U5AxxI	2M
-	 * U5AxxJ	4M
-	 * U59xxI	2M
-	 * U59xxJ	4M */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
-		.DevID						= 0x481,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32U59x/5Ax",
-		.RevIDList					= RevIDList_U59_U5A,
-		.MaxFlashSize				= 4*1024*1024,			/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
-		.MassErase					= MassErase_U5,
-		.Erase						= Erase_U5,
-	},
-	/* U585xI	2M
-	 * U575xG	1M
-	 * U575xI	2M */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
-		.DevID						= 0x482,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32U575/585",
-		.RevIDList					= RevIDList_U575_U585,
-		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
-		.MassErase					= MassErase_U5,
-		.Erase						= Erase_U5,
-	},
-	/* H56xxG	1M
-	 * H56xxI	2M
-	 * H573xI	2M
-	 */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
-		.DevID						= 0x484,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32H562/563/573",
-		.RevIDList					= RevIDList_H5,
-		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x08fff80c,			/* RM0481, 60.2 Flash size data register */
-		.MassErase					= MassErase_H5,
-		.Erase						= Erase_H5,
-	},
-	/* H523xC	256k
-	 * H523xE	512k
-	 * H533xE	512k */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
-		.DevID						= 0x478,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32H523/533",
-		.RevIDList					= RevIDList_H5,
-		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x08fff80c,			/* RM0481, 60.2 Flash size data register */
-		.MassErase					= MassErase_H5,
-		.Erase						= Erase_H5,
-	},
-	/* H503xB	128k */
-	{	.ARMArch					= ARM_ARCH_V8M,
-		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0492, 41.5, ROM Tables */
-		.DevID						= 0x474,				/* RM0492, 41.12.4, DBGMCU_IDCODE */
-		.DevStr						= "STM32H503",
-		.RevIDList					= RevIDList_H5,
-		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x08fff80c,			/* RM0481, 60.2 Flash size data register */
-		.MassErase					= MassErase_H5,
-		.Erase						= Erase_H5,
-	},
-	/* H743xG	1M
-	 * H743xI	2M
-	 * H742xG	1M
-	 * H742xI	2M
-	 * H750xB	128k
-	 * H753xG	1M */
-	{	.ARMArch					= ARM_ARCH_V7M,
-		.IDCODE_RomTableAddr		= 0x5c001000,			/* RM0492, 60.5.8, DBGMCU */
-		.DevID						= 0x450,				/* RM0433, 60.5.8, DBGMCU_IDC */
-		.DevStr						= "STM32H742/743/750/753",
-		.RevIDList					= RevIDList_H7,
-		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
-		.FlashSize_Addr				= 0x1ff1e880,			/* RM0433, 61.2 Flash size */
-		.MassErase					= MassErase_H7,
-		.Erase						= Erase_H7,
-	},
-};
-
 static int FlashMassErase(struct flash_bank* bank) {
 	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	return (dev->MassErase)(bank);
+	const struct STM32H5xxDef_s* dev	= this->Def;
+	if (bank->target->state == TARGET_HALTED) {
+		return (dev->MassErase)(bank);
+	}
+	LOG_ERROR("Target not halted!");
+	return ERROR_TARGET_NOT_HALTED;
 }
 
 static int FlashErase(struct flash_bank* bank, unsigned int first, unsigned int last) {
 	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
-	return (dev->Erase)(bank, first, last);
+	const struct STM32H5xxDef_s* dev	= this->Def;
+	if (bank->target->state == TARGET_HALTED) {
+		return (dev->Erase)(bank, first, last);
+	}
+	LOG_ERROR("Target not halted!");
+	return ERROR_TARGET_NOT_HALTED;
+}
+
+static int FlashWrite(struct flash_bank* bank, const uint8_t* buffer, uint32_t dstOffs, uint32_t nBytes) {
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	const struct STM32H5xxDef_s* dev	= this->Def;
+	if (bank->target->state == TARGET_HALTED) {
+		return (dev->Write)(bank, buffer, dstOffs, nBytes);
+	}
+	LOG_ERROR("Target not halted!");
+	return ERROR_TARGET_NOT_HALTED;
 }
 
 static int GetInfo(struct flash_bank *bank, struct command_invocation *cmd) {
 	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	const struct STM32H5xxDef_s* dev	= this->Dev;
+	const struct STM32H5xxDef_s* dev	= this->Def;
 	if (dev != NULL) {
 		command_print_sameline(cmd, "-");
 	}
 	return ERROR_OK;
-}
-
-static int Probe(struct flash_bank *bank)
-{
-	struct target *target = bank->target;
-	struct STM32H5xxPrv_s* this			= bank->driver_priv;
-	int ret								= ERROR_FAIL;
-
-	if (target_was_examined(target)) {
-		if (this->Dev == NULL) {
-			struct arm* armTarget	= target_to_arm(target);
-			if (armTarget != NULL && is_arm(armTarget)) {
-				for (size_t k = 0; k < (sizeof(DeviceDefs)/sizeof(DeviceDefs[0])); k++) {
-					if (armTarget->arch == DeviceDefs[k].ARMArch) {
-						uint32_t idcode;
-
-						if (target_read_u32(target, DeviceDefs[k].IDCODE_RomTableAddr, &idcode) == ERROR_OK) {
-							if (DeviceDefs[k].DevID == (idcode & 0x0fff)) {
-								LOG_INFO("%s found.", DeviceDefs[k].DevStr);
-								this->Dev			= &(DeviceDefs[k]);
-								
-								/* Try to examine real flash size. */
-								this->FlashSize		= this->Dev->MaxFlashSize;
-								uint16_t val;
-								uint32_t flashSize;
-								if (target_read_u16(target, this->Dev->FlashSize_Addr, &val) == ERROR_OK) {
-									flashSize		= ((uint32_t)val) * 1024;
-									if (0 < flashSize && flashSize <= this->FlashSize) {
-										this->FlashSize		= flashSize;
-										LOG_INFO("Flash size: %ukB", flashSize/1024);
-									}
-									else {
-										LOG_WARNING("MCU indicates invalid flash size (%ukB). Assuming default: %ukB", flashSize/1024, this->FlashSize/1024);
-									}
-								}
-								else {
-									LOG_WARNING("Unable to read flash size from MCU. Assuming default: %ukB", this->FlashSize/1024);
-								}
-
-								return ERROR_OK;
-							}
-						}
-					}
-				}
-			}
-			else {
-				LOG_ERROR("Not a ARM target");
-				ret		= ERROR_FAIL;
-			}
-		}
-		else {
-			ret		= ERROR_OK;		/* Still probed. */
-		}
-	}
-	else {
-		LOG_ERROR("Target not examined yet");
-		ret		= ERROR_TARGET_NOT_EXAMINED;
-	}
-	return ret;
-}
-
-/* flash bank stm32u5_h5_h7 <base> <size> 0 0 <target#> */
-FLASH_BANK_COMMAND_HANDLER(stm32u5_h5_h7_flash_bank_command)
-{
-	if (CMD_ARGC < 6)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-
-	struct STM32H5xxPrv_s* prv	= malloc(sizeof(struct STM32H5xxPrv_s));
-	if (prv != NULL) {
-		prv->Dev			= NULL;
-		bank->driver_priv	= prv;
-		return ERROR_OK;
-	}
-	return ERROR_FAIL;
 }
 
 COMMAND_HANDLER(STM32_MassEraseCommand) {
@@ -535,6 +489,257 @@ COMMAND_HANDLER(STM32_MassEraseCommand) {
 	}
 	else {
 		ret		= ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	return ret;
+}
+
+/**************************************************************************************
+ * Chip definitions
+ *************************************************************************************/
+static const struct RevIDList_s RevIDList_U5F_U5G[] = {{0x1000, 'A'}, {0x1001, 'Z'}, {0, '\0'}};
+static const struct RevIDList_s RevIDList_U59_U5A[] = {{0x3001, 'X'}, {0, '\0'}};
+static const struct RevIDList_s RevIDList_U575_U585[] = {{0x2001, 'X'}, {0x3001, 'W'}, {0, '\0'}};
+static const struct RevIDList_s RevIDList_U535_U545[] = {{0x1001, 'Z'}, {0, '\0'}};
+static const struct RevIDList_s RevIDList_H5[] = {{0x1000, 'A'}, {0x1001, 'Z'}, {0x1007, 'X'}, {0, '\0'}};
+static const struct RevIDList_s RevIDList_H7[] = {{0x1001, 'Z'}, {0x1003, 'Y'}, {0x2001, 'X'}, {0x2003, 'V'}, {0, '\0'}};
+static const struct STM32H5xxDef_s DeviceDefs[] = {
+	/* U535xB	128k
+	 * U535xC	256k
+	 * U535xE	512k
+	 * U545xE	512k */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
+		.DevID						= 0x455,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32U535/545",
+		.RevIDList					= RevIDList_U535_U545,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0456, 7.3.1 Flash memory organization */
+		.FlashPageSize				= 8*1024,				/* RM0456, 7.3.1 Flash memory organization */
+		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
+		.MassErase					= MassErase_U5,
+		.Erase						= Erase_U5,
+	},
+	/* U5GxxJ	4M
+	 * U5FxxJ	4M
+	 * U5FxxI	2M */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
+		.DevID						= 0x476,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32U5Fx/5Gx",
+		.RevIDList					= RevIDList_U5F_U5G,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0456, 7.3.1 Flash memory organization */
+		.FlashPageSize				= 8*1024,				/* RM0456, 7.3.1 Flash memory organization */
+		.MaxFlashSize				= 4*1024*1024,			/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
+		.MassErase					= MassErase_U5,
+		.Erase						= Erase_U5,
+	},
+	/* U5AxxI	2M
+	 * U5AxxJ	4M
+	 * U59xxI	2M
+	 * U59xxJ	4M */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
+		.DevID						= 0x481,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32U59x/5Ax",
+		.RevIDList					= RevIDList_U59_U5A,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0456, 7.3.1 Flash memory organization */
+		.FlashPageSize				= 8*1024,				/* RM0456, 7.3.1 Flash memory organization */
+		.MaxFlashSize				= 4*1024*1024,			/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
+		.MassErase					= MassErase_U5,
+		.Erase						= Erase_U5,
+	},
+	/* U585xI	2M
+	 * U575xG	1M
+	 * U575xI	2M */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0xe0044000,			/* RM0456, 75.5, ROM Tables */
+		.DevID						= 0x482,				/* RM0456, 75.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32U575/585",
+		.RevIDList					= RevIDList_U575_U585,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0456, 7.3.1 Flash memory organization */
+		.FlashPageSize				= 8*1024,				/* RM0456, 7.3.1 Flash memory organization */
+		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
+		.MassErase					= MassErase_U5,
+		.Erase						= Erase_U5,
+	},
+	/* H56xxG	1M
+	 * H56xxI	2M
+	 * H573xI	2M
+	 */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
+		.DevID						= 0x484,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32H562/563/573",
+		.RevIDList					= RevIDList_H5,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0481, 7.2 Flash main features */
+		.FlashPageSize				= 8*1024,				/* RM0481, 7.2 Flash main features */
+		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x08fff80c,			/* RM0481, 60.2 Flash size data register */
+		.MassErase					= MassErase_H5,
+		.Erase						= Erase_H5,
+		.Write						= Write_H5,
+	},
+	/* H523xC	256k
+	 * H523xE	512k
+	 * H533xE	512k */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0481, 59.5, ROM Tables */
+		.DevID						= 0x478,				/* RM0481, 59.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32H523/533",
+		.RevIDList					= RevIDList_H5,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0481, 7.2 Flash main features */
+		.FlashPageSize				= 8*1024,				/* RM0481, 7.2 Flash main features */
+		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x08fff80c,			/* RM0481, 60.2 Flash size data register */
+		.MassErase					= MassErase_H5,
+		.Erase						= Erase_H5,
+		.Write						= Write_H5,
+	},
+	/* H503xB	128k */
+	{	.ARMArch					= ARM_ARCH_V8M,
+		.IDCODE_RomTableAddr		= 0x44024000,			/* RM0492, 41.5, ROM Tables */
+		.DevID						= 0x474,				/* RM0492, 41.12.4, DBGMCU_IDCODE */
+		.DevStr						= "STM32H503",
+		.RevIDList					= RevIDList_H5,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 128/8,				/* RM0492, 7.2 Flash main features */
+		.FlashPageSize				= 8*1024,				/* RM0492, 7.2 Flash main features */
+		.MaxFlashSize				= 512*1024,				/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x08fff80c,			/* RM0492, 60.2 Flash size data register */
+		.MassErase					= MassErase_H5,
+		.Erase						= Erase_H5,
+		.Write						= Write_H5,
+	},
+	/* H743xG	1M
+	 * H743xI	2M
+	 * H742xG	1M
+	 * H742xI	2M
+	 * H750xB	128k
+	 * H753xG	1M */
+	{	.ARMArch					= ARM_ARCH_V7M,
+		.IDCODE_RomTableAddr		= 0x5c001000,			/* RM0433, 60.5.8, DBGMCU */
+		.DevID						= 0x450,				/* RM0433, 60.5.8, DBGMCU_IDC */
+		.DevStr						= "STM32H742/743/750/753",
+		.RevIDList					= RevIDList_H7,
+		.FlashBaseAddr				= 0x08000000,
+		.FlashBusWidth				= 256/8,				/* RM0433, 4.2 Flash main features */
+		.FlashPageSize				= 128*1024,				/* RM0433, 4.2 Flash main features */
+		.MaxFlashSize				= 2*1024*1024,			/* DS, 7 Ordering information */
+		.FlashSize_Addr				= 0x1ff1e880,			/* RM0433, 61.2 Flash size */
+		.MassErase					= MassErase_H7,
+		.Erase						= Erase_H7,
+	},
+};
+
+/* flash bank stm32u5_h5_h7 <base> <size> 0 0 <target#> */
+FLASH_BANK_COMMAND_HANDLER(stm32u5_h5_h7_flash_bank_command)
+{
+	if (CMD_ARGC < 6)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	struct STM32H5xxPrv_s* prv	= malloc(sizeof(struct STM32H5xxPrv_s));
+	if (prv != NULL) {
+		prv->Def			= NULL;
+		bank->driver_priv	= prv;
+		return ERROR_OK;
+	}
+	return ERROR_FAIL;
+}
+
+static int Probe(struct flash_bank *bank)
+{
+	struct target *target = bank->target;
+	struct STM32H5xxPrv_s* this			= bank->driver_priv;
+	int ret								= ERROR_FAIL;
+
+	if (target_was_examined(target)) {
+		struct arm* armTarget	= target_to_arm(target);
+		if (armTarget != NULL && is_arm(armTarget)) {
+			if (this->Def == NULL) {
+				for (size_t k = 0; k < (sizeof(DeviceDefs)/sizeof(DeviceDefs[0])); k++) {
+					if (armTarget->arch == DeviceDefs[k].ARMArch) {
+						uint32_t idcode;
+
+						if (target_read_u32(target, DeviceDefs[k].IDCODE_RomTableAddr, &idcode) == ERROR_OK) {
+							if (DeviceDefs[k].DevID == (idcode & 0x0fff)) {
+								LOG_INFO("%s found.", DeviceDefs[k].DevStr);
+								this->Def					= &(DeviceDefs[k]);
+								ret							= ERROR_OK;
+								break;
+							}
+						}
+					}
+				}
+			}
+			else {
+				ret			= ERROR_OK;
+			}
+
+			const struct STM32H5xxDef_s* def	= this->Def;
+			if (ret == ERROR_OK && def != NULL) {
+				if (bank->base == def->FlashBaseAddr) {
+					/* Try to examine real flash size. */
+					uint16_t val;
+					uint32_t flashSize;
+					if (bank->size == 0) {
+						bank->size			= def->MaxFlashSize;
+					}
+					else if (def->MaxFlashSize < bank->size) {
+						LOG_WARNING("Size given at 'flash bank' command (%ukB) exceeds maximum flash size!", bank->size/1024);
+						bank->size			= def->MaxFlashSize;
+					}
+					if (def->FlashSize_Addr != 0) {
+						if (target_read_u16(target, def->FlashSize_Addr, &val) == ERROR_OK) {
+							flashSize		= ((uint32_t)val) * 1024;
+							if (0 < flashSize && flashSize <= def->MaxFlashSize) {
+								if (0 < bank->size && bank->size != flashSize) {
+									LOG_WARNING("Size given at 'flash bank' command (%ukB) differs from device reported size!", bank->size/1024);
+								}
+								bank->size		= flashSize;
+							}
+							else {
+								LOG_WARNING("MCU indicates invalid flash size (%ukB).", flashSize/1024);
+							}
+						}
+						else {
+							LOG_WARNING("Unable to read flash size from MCU.");
+						}
+					}
+					LOG_INFO("Using flash size: %ukB", bank->size/1024);
+
+					bank->chip_width				= def->FlashBusWidth;
+					bank->bus_width					= def->FlashBusWidth;
+					bank->write_start_alignment		= def->FlashBusWidth;
+					bank->minimal_write_gap			= def->FlashBusWidth;
+					bank->num_sectors				= 0; //(bank->size / def->FlashPageSize);
+					ret								= ERROR_OK;
+				}
+				else {
+					LOG_ERROR("Unknown flash area at 0x%08lx", bank->base);
+					ret				= ERROR_FAIL;
+				}
+			}
+			else {
+				ret		= ERROR_OK;		/* Still probed. */
+			}
+		}
+		else {
+			LOG_ERROR("Not a ARM target");
+			ret		= ERROR_FAIL;
+		}
+	}
+	else {
+		LOG_ERROR("Target not examined yet");
+		ret		= ERROR_TARGET_NOT_EXAMINED;
 	}
 	return ret;
 }
@@ -581,8 +786,8 @@ const struct flash_driver stm32u5_h5_h7_flash = {
 	.flash_bank_command		= stm32u5_h5_h7_flash_bank_command,
 	.erase					= FlashErase,
 	.protect				= NULL, //stm32l4_protect,
-	.write					= NULL, //stm32l4_write,
-	.read					= NULL, //default_flash_read,
+	.write					= FlashWrite,
+	.read					= default_flash_read,
 	.probe					= Probe,
 	.auto_probe				= Probe,
 	.erase_check			= default_flash_blank_check,
