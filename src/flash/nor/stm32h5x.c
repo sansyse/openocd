@@ -143,7 +143,91 @@ static int MassErase_U5(struct flash_bank* bank) {
 }
 
 static int Erase_U5(struct flash_bank* bank, unsigned int first, unsigned int last) {
-	return 0;
+	assert(bank != NULL);
+	struct STM32H5xxPrv_s* prv			= (struct STM32H5xxPrv_s*)(bank->driver_priv);
+	assert(prv != NULL);
+	const struct STM32H5xxDef_s* def	= prv->Def;
+	assert(def != NULL);
+	unsigned int nSectorsTotal			= bank->size / def->FlashPageSize;
+	assert((nSectorsTotal & 1) == 0);
+	assert(first <= last && last <= nSectorsTotal);
+	unsigned int nSectorsPerBank		= nSectorsTotal;
+	assert(nSectorsPerBank <= 0xff);
+	int ret								= ERROR_FAIL;
+
+	if ((ret = CheckNoOp_U5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_U5(bank)) == ERROR_OK
+		&& (ret = Unlock_U5(bank)) == ERROR_OK) {
+		for (unsigned int sector = first; sector <= last; sector++) {
+			LOG_INFO("Erasing sector %u (%u..%u)", sector, first, last);
+
+			uint32_t cr		= 0x00010002u;
+			if (sector < nSectorsPerBank) {
+				cr			|= (sector << 3);
+			}
+			else {
+				cr			|= ((sector - nSectorsPerBank) << 3) | (0x00000800u);
+			}
+
+			/* Start sector erase */
+			if ((ret = target_write_u32(bank->target, U5_NSCR, cr)) == ERROR_OK) {
+				ret			= Wait4EOP_U5(bank, 300);
+
+				/* Reset SER bit */
+				target_write_u32(bank->target, U5_NSCR, 0x00000000);
+			}
+		}
+
+		/* Lock flash */
+		Lock_U5(bank);
+	}
+	return ret;
+}
+
+static int Write_U5(struct flash_bank* bank, const uint8_t* buffer, uint32_t dstOffs, uint32_t nBytes) {
+	assert(bank != NULL);
+	assert((dstOffs + nBytes) <= bank->size);
+	uint32_t addr						= (dstOffs + bank->base);
+	assert((addr & 127) == 0);
+	assert(bank->chip_width == 128/8);
+	struct STM32H5xxPrv_s* prv			= (struct STM32H5xxPrv_s*)(bank->driver_priv);
+	assert(prv != NULL);
+	const struct STM32H5xxDef_s* def	= prv->Def;
+	assert(def != NULL);
+	int ret								= ERROR_FAIL;
+
+	if ((ret = CheckNoOp_U5(bank)) == ERROR_OK
+		&& (ret = ClearErrorFlags_U5(bank)) == ERROR_OK
+		&& (ret = Unlock_U5(bank)) == ERROR_OK) {
+		LOG_INFO("Programming %u bytes at 0x%08x", nBytes, addr);
+		/* Start programming */
+		if ((ret = target_write_u32(bank->target, U5_NSCR, 0x00000001)) == ERROR_OK) {
+			uint8_t		data[128/8];
+			while (0 < nBytes && ret == ERROR_OK) {
+				size_t bi	= 0;
+				while (bi < sizeof(data) && 0 < nBytes) {
+					data[bi++]		= *(buffer++);
+					nBytes--;
+				}
+				while (bi < sizeof(data)) {
+					data[bi++]		= 0xff;
+				}
+				if ((ret = target_write_memory(bank->target, addr, 32/8, 128/32, data)) != ERROR_OK) {
+					LOG_ERROR("Write operation failed! 0x%08x", addr);
+					break;
+				}
+				addr		+= 128/8;
+				ret			= Wait4EOP_U5(bank, 300);
+			}
+
+			/* Reset PG bit */
+			target_write_u32(bank->target, U5_NSCR, 0x00000000);
+		}
+
+		/* Lock flash */
+		Lock_U5(bank);
+	}
+	return ret;
 }
 #undef U5_NSKEYR
 #undef U5_NSSR
@@ -251,7 +335,7 @@ static int Erase_H5(struct flash_bank* bank, unsigned int first, unsigned int la
 	assert((nSectorsTotal & 1) == 0);
 	assert(first <= last && last <= nSectorsTotal);
 	unsigned int nSectorsPerBank		= nSectorsTotal;
-	assert(nSectorsPerBank < 0x7f);
+	assert(nSectorsPerBank <= 0x7f);
 	int ret								= ERROR_FAIL;
 
 	if ((ret = CheckNoOp_H5(bank)) == ERROR_OK
@@ -519,6 +603,7 @@ static const struct STM32H5xxDef_s DeviceDefs[] = {
 		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
 		.MassErase					= MassErase_U5,
 		.Erase						= Erase_U5,
+		.Write						= Write_U5,
 	},
 	/* U5GxxJ	4M
 	 * U5FxxJ	4M
@@ -535,6 +620,7 @@ static const struct STM32H5xxDef_s DeviceDefs[] = {
 		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
 		.MassErase					= MassErase_U5,
 		.Erase						= Erase_U5,
+		.Write						= Write_U5,
 	},
 	/* U5AxxI	2M
 	 * U5AxxJ	4M
@@ -552,6 +638,7 @@ static const struct STM32H5xxDef_s DeviceDefs[] = {
 		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
 		.MassErase					= MassErase_U5,
 		.Erase						= Erase_U5,
+		.Write						= Write_U5,
 	},
 	/* U585xI	2M
 	 * U575xG	1M
@@ -568,6 +655,7 @@ static const struct STM32H5xxDef_s DeviceDefs[] = {
 		.FlashSize_Addr				= 0x0bfa07a0,			/* RM0456, 76.2 Flash size data register */
 		.MassErase					= MassErase_U5,
 		.Erase						= Erase_U5,
+		.Write						= Write_U5,
 	},
 	/* H56xxG	1M
 	 * H56xxI	2M
