@@ -511,10 +511,10 @@ static int MassErase_H7(struct flash_bank* bank) {
 		/* Start mass erase */
 		if ((ret = target_write_u32(bank->target, H7_CR(0), 0x00000088)) == ERROR_OK
 			&& (ret = target_write_u32(bank->target, H7_CR(1), 0x00000088)) == ERROR_OK) {
-			if ((ret = Wait4EOP_H7(bank, 0, 10000)) != ERROR_OK) {
+			if ((ret = Wait4EOP_H7(bank, 0, 50000)) != ERROR_OK) {
 				LOG_ERROR("End of operation failed!");
 			}
-			else if ((ret = Wait4EOP_H7(bank, 1, 300)) != ERROR_OK) {
+			else if ((ret = Wait4EOP_H7(bank, 1, 1000)) != ERROR_OK) {
 				LOG_ERROR("End of operation failed!");
 			}
 
@@ -640,7 +640,7 @@ static int Write_H7(struct flash_bank* bank, const uint8_t* buffer, uint32_t dst
 		}
 		else {
 			todo[1].Source	= buffer;
-			todo[1].Addr	= dstOffs;
+			todo[1].Addr	= (bank->base + dstOffs);
 			todo[1].NBytes	= nBytes;
 		}
 		todo[1].InProgress	= true;
@@ -672,12 +672,12 @@ static int Write_H7(struct flash_bank* bank, const uint8_t* buffer, uint32_t dst
 							data[bi++]		= 0xff;
 						}
 						if ((ret = target_write_memory(bank->target, todo[bankNum].Addr, 32/8, 256/32, data)) != ERROR_OK) {
-							LOG_ERROR("Write operation failed! 0x%08x", todo[bankNum].Addr);
+							LOG_ERROR("Write operation failed! #%u sr=0x%08x", bankNum, todo[bankNum].Addr);
 							break;
 						}
 				//		LOG_INFO("Chunk#%u  %08x", bankNum, todo[bankNum].Addr);
 						todo[bankNum].Addr		+= 256/8;
-						todo[bankNum].Timeout	= 500;
+						todo[bankNum].Timeout	= 1000;
 					}
 					else {
 						todo[bankNum].InProgress	= false;
